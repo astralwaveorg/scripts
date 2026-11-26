@@ -1,7 +1,6 @@
 #!/bin/sh
 set -eu
 
-# 可通过命令行参数或环境变量覆盖的默认值
 PORT="${PORT:-}"
 SNI="${SNI:-www.apple.com}"
 MEM_LIMIT="${MEM_LIMIT:-65MiB}"
@@ -44,7 +43,6 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-# 清理可能存在的旧 nokey 残留（避免违规协议或配置冲突）
 cleanup_nokey() {
   if [ -x /usr/local/bin/nokey ]; then
     /usr/local/bin/nokey --remove >/dev/null 2>&1 || true
@@ -61,7 +59,6 @@ if [ "$REMOVE_MODE" -eq 1 ]; then
   exit 0
 fi
 
-# 交互模式：仅询问必要参数，直接回车使用默认值
 if [ "$INTERACTIVE" -eq 1 ] && [ "$SILENT" -eq 0 ]; then
   printf "监听端口 [10000-65000，留空自动随机]: "
   read -r in_port || true
@@ -76,7 +73,6 @@ if [ "$INTERACTIVE" -eq 1 ] && [ "$SILENT" -eq 0 ]; then
   [ -n "${in_conn:-}" ] && MAX_CONN="$in_conn"
 fi
 
-# 检查端口是否已被占用（优先读取 /proc/net/tcp 与 /proc/net/tcp6，零外部依赖）
 is_port_in_use() {
   target_port="$1"
   hex_port=$(printf '%04X' "$target_port")
@@ -90,7 +86,6 @@ is_port_in_use() {
   return 1
 }
 
-# 生成 10000-65000 之间的随机空闲端口
 pick_random_port() {
   attempt=0
   while [ "$attempt" -lt 60 ]; do
@@ -109,9 +104,9 @@ pick_random_port() {
 
 cleanup_nokey
 
-# 安装 Alpine 依赖与 sing-box
-apk update >/dev/null 2>&1
-apk add --no-cache sing-box ca-certificates curl iptables >/dev/null 2>&1
+# 安装 Alpine 依赖与 sing-box（使用 wget/apk 默认行为，失败及时报错退出）
+apk update >/dev/null
+apk add --no-cache sing-box ca-certificates curl iptables >/dev/null
 
 if [ -z "${PORT:-}" ]; then
   PORT=$(pick_random_port)
@@ -129,14 +124,13 @@ if [ "$PORT" -lt 10000 ] || [ "$PORT" -gt 65000 ]; then
   exit 1
 fi
 
-# 生成 UUID、Reality 密钥对与 ShortId
 UUID=$(sing-box generate uuid)
 KEYPAIR_OUT=$(sing-box generate reality-keypair)
 PRIVATE_KEY=$(echo "$KEYPAIR_OUT" | awk '/PrivateKey:/ {print $2}')
 PUBLIC_KEY=$(echo "$KEYPAIR_OUT" | awk '/PublicKey:/ {print $2}')
 SHORT_ID=$(sing-box generate rand --hex 8)
 
-# 探测本机公网 IPv4 / IPv6（多源容错）
+# 公网 IP 探测严格加超时，防止网络抖动导致脚本卡死
 IPV4=$(curl -fsSL4 --connect-timeout 3 --max-time 6 https://api.ipify.org 2>/dev/null \
   || curl -fsSL4 --connect-timeout 3 --max-time 6 https://ifconfig.me/ip 2>/dev/null \
   || true)
@@ -153,7 +147,6 @@ else
   HOST_IP="127.0.0.1"
 fi
 
-# 写入极简、防 OOM 的 sing-box 配置（零规则集、无明文入站）
 mkdir -p /etc/sing-box
 cat << EOF > /etc/sing-box/config.json
 {
@@ -202,26 +195,22 @@ cat << EOF > /etc/sing-box/config.json
 }
 EOF
 
-# 配置 OpenRC 环境变量限制 Go 堆内存上限，降低 128MB 内存 OOM 风险
 cat << EOF > /etc/conf.d/sing-box
 export GOMEMLIMIT=${MEM_LIMIT}
 export GOGC=50
 EOF
 
-# 校验配置并启动服务
 sing-box check -c /etc/sing-box/config.json >/dev/null
 rc-update add sing-box default >/dev/null 2>&1 || true
 rc-service sing-box stop >/dev/null 2>&1 || true
 rc-service sing-box start >/dev/null 2>&1
 
-# 确认进程已拉起
 sleep 1
 if ! pidof sing-box >/dev/null 2>&1 && ! pgrep -x sing-box >/dev/null 2>&1; then
   echo "sing-box 启动失败，请检查 /etc/sing-box/config.json 与内存状态" >&2
   exit 1
 fi
 
-# 设置单 IP 并发 TCP 连接上限（清理旧 connlimit 规则后重新写入，避免重复；内核不支持时安全跳过）
 case "$MAX_CONN" in
   ''|*[!0-9]*) MAX_CONN=0 ;;
 esac
@@ -236,7 +225,6 @@ if [ "$MAX_CONN" -gt 0 ]; then
   fi
 fi
 
-# 输出最终节点信息与 Clash/Mihomo 配置
 {
   echo "IPv4: ${IPV4:-无}"
   echo "IPv6: ${IPV6:-无}"
