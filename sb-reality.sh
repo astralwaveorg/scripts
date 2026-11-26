@@ -78,7 +78,7 @@ is_port_in_use() {
   hex_port=$(printf '%04X' "$target_port")
   for tbl in /proc/net/tcp /proc/net/tcp6; do
     if [ -r "$tbl" ]; then
-      if awk -v hp="$hex_port" 'NR>1 {split($2, a, ":"); if (toupper(a[2]) == hp) found=1} END {exit !found}'; then
+      if awk -v hp="$hex_port" 'NR>1 {split($2, a, ":"); if (toupper(a[2]) == hp) {found=1; exit}} END {exit !found}' "$tbl"; then
         return 0
       fi
     fi
@@ -87,11 +87,10 @@ is_port_in_use() {
 }
 
 pick_random_port() {
+  seed=$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ' || echo "$$")
   attempt=0
-  while [ "$attempt" -lt 60 ]; do
-    b1=$(dd if=/dev/urandom bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
-    b2=$(dd if=/dev/urandom bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
-    r=$(( (b1 * 256 + b2) % 55001 ))
+  while [ "$attempt" -lt 30 ]; do
+    r=$(( (seed + attempt * 7919) % 55001 ))
     cand=$((10000 + r))
     if ! is_port_in_use "$cand"; then
       echo "$cand"
@@ -104,9 +103,8 @@ pick_random_port() {
 
 cleanup_nokey
 
-# 安装 Alpine 依赖与 sing-box（使用 wget/apk 默认行为，失败及时报错退出）
 apk update >/dev/null
-apk add --no-cache sing-box ca-certificates curl iptables >/dev/null
+apk add --no-cache sing-box ca-certificates curl >/dev/null
 
 if [ -z "${PORT:-}" ]; then
   PORT=$(pick_random_port)
@@ -130,11 +128,10 @@ PRIVATE_KEY=$(echo "$KEYPAIR_OUT" | awk '/PrivateKey:/ {print $2}')
 PUBLIC_KEY=$(echo "$KEYPAIR_OUT" | awk '/PublicKey:/ {print $2}')
 SHORT_ID=$(sing-box generate rand --hex 8)
 
-# 公网 IP 探测严格加超时，防止网络抖动导致脚本卡死
-IPV4=$(curl -fsSL4 --connect-timeout 3 --max-time 6 https://api.ipify.org 2>/dev/null \
-  || curl -fsSL4 --connect-timeout 3 --max-time 6 https://ifconfig.me/ip 2>/dev/null \
+IPV4=$(curl -fsSL4 --connect-timeout 2 --max-time 3 https://api.ipify.org 2>/dev/null \
+  || curl -fsSL4 --connect-timeout 2 --max-time 3 https://ifconfig.me/ip 2>/dev/null \
   || true)
-IPV6=$(curl -fsSL6 --connect-timeout 3 --max-time 6 https://api64.ipify.org 2>/dev/null \
+IPV6=$(curl -fsSL6 --connect-timeout 2 --max-time 3 https://api64.ipify.org 2>/dev/null \
   || true)
 
 if [ -n "${HOST_IP_OVERRIDE:-}" ]; then
@@ -202,8 +199,7 @@ EOF
 
 sing-box check -c /etc/sing-box/config.json >/dev/null
 rc-update add sing-box default >/dev/null 2>&1 || true
-rc-service sing-box stop >/dev/null 2>&1 || true
-rc-service sing-box start >/dev/null 2>&1
+rc-service sing-box restart >/dev/null 2>&1 || true
 
 sleep 1
 if ! pidof sing-box >/dev/null 2>&1 && ! pgrep -x sing-box >/dev/null 2>&1; then
@@ -215,14 +211,11 @@ case "$MAX_CONN" in
   ''|*[!0-9]*) MAX_CONN=0 ;;
 esac
 
-if [ "$MAX_CONN" -gt 0 ]; then
+if [ "$MAX_CONN" -gt 0 ] && command -v iptables >/dev/null 2>&1; then
   while iptables -D INPUT -p tcp --syn -m connlimit --connlimit-mask 32 -j DROP >/dev/null 2>&1; do
     :
   done
-  if iptables -A INPUT -p tcp --syn --dport "$PORT" -m connlimit --connlimit-above "$MAX_CONN" --connlimit-mask 32 -j DROP >/dev/null 2>&1; then
-    rc-update add iptables default >/dev/null 2>&1 || true
-    rc-service iptables save >/dev/null 2>&1 || true
-  fi
+  iptables -A INPUT -p tcp --syn --dport "$PORT" -m connlimit --connlimit-above "$MAX_CONN" --connlimit-mask 32 -j DROP >/dev/null 2>&1 || true
 fi
 
 {
