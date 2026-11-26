@@ -76,20 +76,20 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-# 精准清理旧端口的 iptables connlimit 规则
+# 清理本脚本历次运行留下的 iptables connlimit 规则（含旧端口遗留）
+# 只删「每 IP 并发限制 + DROP」这一种签名，不碰其它防火墙规则
 cleanup_old_iptables() {
   command -v iptables >/dev/null 2>&1 || return 0
-  old_port=""
-  if [ -r /etc/sing-box/config.json ]; then
-    old_port=$(awk -F: '/"listen_port"/ {gsub(/[^0-9]/, "", $2); print $2; exit}' /etc/sing-box/config.json 2>/dev/null || true)
-  fi
-  if [ -n "${old_port:-}" ]; then
-    iptables -S INPUT 2>/dev/null | grep -- "--dport ${old_port} " | grep 'connlimit' | while IFS= read -r rule; do
-      del_rule="${rule#-A }"
-      # shellcheck disable=SC2086
-      iptables -D $del_rule >/dev/null 2>&1 || true
-    done
-  fi
+  iptables -S INPUT 2>/dev/null \
+    | grep -- '-m connlimit' \
+    | grep -- '--connlimit-mask 32' \
+    | grep -- '--connlimit-saddr' \
+    | grep -- '-j DROP' \
+    | while IFS= read -r rule; do
+        del_rule="${rule#-A }"
+        # shellcheck disable=SC2086
+        iptables -D $del_rule >/dev/null 2>&1 || true
+      done
 }
 
 # 彻底清理旧配置、状态文件、残留进程与规则（不卸载软件包）
@@ -106,10 +106,7 @@ cleanup_old_state() {
     wait_cnt=$((wait_cnt + 1))
   done
 
-  if [ -x /usr/local/bin/nokey ]; then
-    /usr/local/bin/nokey --remove >/dev/null 2>&1 || true
-  fi
-  rm -rf /usr/local/bin/nokey /usr/local/etc/nokey
+  # 只清理本脚本允许改动的路径，不动 /usr/local/bin 下的其它工具
   rm -f /etc/sing-box/*.json /etc/conf.d/sing-box "$OUT_FILE"
   rm -rf /var/lib/sing-box/*
 }
@@ -321,13 +318,24 @@ else
   log_warn "未能自动探测到公网 IP，输出配置中暂用 127.0.0.1，请手动替换。"
 fi
 
-# 兼容判断监听地址：开启 bindv6only=1 或无 IPv6 时切为 0.0.0.0
-LISTEN_ADDR="::"
-if [ ! -r /proc/net/if_inet6 ]; then
-  LISTEN_ADDR="0.0.0.0"
-elif [ -r /proc/sys/net/ipv6/bindv6only ] && [ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null)" = "1" ]; then
-  LISTEN_ADDR="0.0.0.0"
+# 判断是否处于 NAT 内网：本机只有私网 IPv4，公网地址由上游映射
+NAT_MODE=0
+LOCAL_IPV4=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d/ -f1)
+case "${LOCAL_IPV4:-}" in
+  10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|100.6[4-9].*|100.[7-9][0-9].*|100.1[0-2][0-9].*)
+    if [ -n "${RAW_IP:-}" ] && [ "$RAW_IP" != "127.0.0.1" ] && [ "$RAW_IP" != "$LOCAL_IPV4" ]; then
+      NAT_MODE=1
+    fi ;;
+esac
+
+# 监听地址：有全局 IPv6 且 bindv6only=0 时用 ::（同时收 IPv4），否则用 0.0.0.0
+LISTEN_ADDR="0.0.0.0"
+GLOBAL_IPV6=$(ip -6 addr show scope global 2>/dev/null | awk '/inet6 /{print $2; exit}')
+if [ -n "${GLOBAL_IPV6:-}" ] && [ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 0)" != "1" ]; then
+  LISTEN_ADDR="::"
 fi
+LISTEN_DISPLAY="${LISTEN_ADDR}:${PORT}"
+[ "$LISTEN_ADDR" = "::" ] && LISTEN_DISPLAY="[::]:${PORT}"
 
 NODE_NAME="Reality-${RAW_IP}-${PORT}"
 VLESS_LINK="vless://${UUID}@${HOST_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
@@ -407,6 +415,23 @@ if [ "$started" -ne 1 ]; then
   exit 1
 fi
 
+# 外部连通自检：从本机访问公网 IP:端口（NAT 支持 hairpin 时结果可信）
+EXTERNAL_CHECK="skipped"
+if [ -n "${RAW_IP:-}" ] && [ "$RAW_IP" != "127.0.0.1" ] && command -v nc >/dev/null 2>&1; then
+  if nc -z -w5 "$RAW_IP" "$PORT" >/dev/null 2>&1; then
+    EXTERNAL_CHECK="ok"
+  else
+    EXTERNAL_CHECK="failed"
+  fi
+fi
+
+# 进程内存占用（供部署结果核对，正常应低于 MEM_LIMIT）
+SB_PID=$(pidof sing-box 2>/dev/null | awk '{print $1}')
+RSS_MIB="?"
+if [ -n "${SB_PID:-}" ] && [ -r "/proc/${SB_PID}/status" ]; then
+  RSS_MIB=$(awk '/VmRSS:/ {printf "%.1f", $2/1024}' "/proc/${SB_PID}/status")
+fi
+
 # 可选：单 IP 并发限制
 case "$MAX_CONN" in
   ''|*[!0-9]*) MAX_CONN=0 ;;
@@ -426,6 +451,18 @@ if command -v iptables >/dev/null 2>&1; then
   fi
 fi
 
+# 网络可达性提示：NAT 环境必须由商家面板做端口映射
+NET_NOTE=""
+if [ "$NAT_MODE" -eq 1 ]; then
+  NET_NOTE="  [!] NAT 内网环境：内网 ${LOCAL_IPV4}，公网 ${RAW_IP}"
+  NET_NOTE="${NET_NOTE}
+      需在商家 NAT/安全组面板把公网端口 ${PORT} 映射到 ${LOCAL_IPV4}:${PORT}，否则外部不可达。"
+fi
+if [ "$EXTERNAL_CHECK" = "failed" ]; then
+  NET_NOTE="${NET_NOTE}
+  [!] 外部自检未通过：${RAW_IP}:${PORT} 当前不可达（端口映射或安全组未放行）。"
+fi
+
 {
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "  [✓] sing-box VLESS-Reality 节点部署成功"
@@ -435,9 +472,10 @@ fi
   echo "  节点名称  : ${NODE_NAME}"
   echo "  IPv4 地址 : ${IPV4:-无}"
   echo "  IPv6 地址 : ${IPV6:-无}"
-  echo "  监听地址  : ${LISTEN_ADDR}:${PORT}"
+  echo "  监听地址  : ${LISTEN_DISPLAY}"
+  echo "  外部自检  : ${EXTERNAL_CHECK}"
+  echo "  内存占用  : ${RSS_MIB} MiB / 上限 ${MEM_LIMIT}"
   echo "  伪装 SNI  : ${SNI}"
-  echo "  内存上限  : ${MEM_LIMIT}"
   echo "  用户 UUID : ${UUID}"
   echo "  PublicKey : ${PUBLIC_KEY}"
   echo "  ShortId   : ${SHORT_ID}"
@@ -474,6 +512,7 @@ fi
   echo "  • 结果已保存至 ${OUT_FILE}，随时可用 cat ${OUT_FILE} 查看。"
   echo "  • 服务端已启用 multiplex，建议客户端开启 smux 降低并发数。"
   [ -n "$FW_NOTE" ] && echo "$FW_NOTE"
+  [ -n "$NET_NOTE" ] && echo "$NET_NOTE"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 } > "$OUT_FILE"
 
