@@ -136,13 +136,20 @@ IPV6=$(curl -fsSL6 --connect-timeout 2 --max-time 3 https://api64.ipify.org 2>/d
 
 if [ -n "${HOST_IP_OVERRIDE:-}" ]; then
   HOST_IP="$HOST_IP_OVERRIDE"
+  RAW_IP="$HOST_IP_OVERRIDE"
 elif [ -n "${IPV4:-}" ]; then
   HOST_IP="$IPV4"
+  RAW_IP="$IPV4"
 elif [ -n "${IPV6:-}" ]; then
   HOST_IP="[$IPV6]"
+  RAW_IP="$IPV6"
 else
   HOST_IP="127.0.0.1"
+  RAW_IP="127.0.0.1"
 fi
+
+NODE_NAME="Reality-${RAW_IP}-${PORT}"
+VLESS_LINK="vless://${UUID}@${HOST_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
 
 mkdir -p /etc/sing-box
 cat << EOF > /etc/sing-box/config.json
@@ -219,17 +226,27 @@ if [ "$MAX_CONN" -gt 0 ] && command -v iptables >/dev/null 2>&1; then
 fi
 
 {
-  echo "IPv4: ${IPV4:-无}"
-  echo "IPv6: ${IPV6:-无}"
-  echo "端口: ${PORT}"
-  echo "UUID: ${UUID}"
-  echo "PublicKey: ${PUBLIC_KEY}"
-  echo "ShortId: ${SHORT_ID}"
-  echo "SNI: ${SNI}"
+  echo "=========================================="
+  echo "  sing-box VLESS-Reality 节点已部署完成"
+  echo "=========================================="
   echo ""
-  echo "--- Clash / Mihomo 节点配置 ---"
+  echo "[节点基础参数]"
+  echo "  节点名称  : ${NODE_NAME}"
+  echo "  IPv4 地址 : ${IPV4:-无}"
+  echo "  IPv6 地址 : ${IPV6:-无}"
+  echo "  监听端口  : ${PORT}"
+  echo "  伪装 SNI  : ${SNI}"
+  echo "  内存上限  : ${MEM_LIMIT}"
+  echo "  用户 UUID : ${UUID}"
+  echo "  PublicKey : ${PUBLIC_KEY}"
+  echo "  ShortId   : ${SHORT_ID}"
+  echo ""
+  echo "[可直接导入的 VLESS 分享链接]"
+  echo "  ${VLESS_LINK}"
+  echo ""
+  echo "[Clash / Mihomo 节点配置]"
   echo "proxies:"
-  echo "  - name: \"Reality-${HOST_IP}-${PORT}\""
+  echo "  - name: \"${NODE_NAME}\""
   echo "    type: vless"
   echo "    server: ${HOST_IP}"
   echo "    port: ${PORT}"
@@ -248,6 +265,12 @@ fi
   echo "      max-connections: 2"
   echo "      min-streams: 4"
   echo "      padding: true"
+  echo ""
+  echo "[使用与排障提示]"
+  echo "  1. 分享链接适用于支持 VLESS-Reality 的客户端（如 v2rayN / Shadowrocket / Streisand / Mihomo）。"
+  echo "  2. 服务端已启用 multiplex，建议客户端开启多路复用以减少并发连接数，避免触发高并发限制。"
+  echo "  3. 信息已保存至 ${OUT_FILE}，后续可用 cat ${OUT_FILE} 随时查看。"
+  echo "=========================================="
 } > "$OUT_FILE"
 
 chmod 600 "$OUT_FILE"
